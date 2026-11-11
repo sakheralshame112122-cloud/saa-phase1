@@ -1,0 +1,223 @@
+name: saa-core
+
+x-api-env: &api-env
+  APP_ENV: ${APP_ENV}
+  APP_SECRET: ${APP_SECRET}
+  SESSION_SECRET: ${SESSION_SECRET}
+  KEK_PATH: ${KEK_PATH}
+  LOG_LEVEL: ${LOG_LEVEL}
+  SCHEDULER_TIMEZONE: ${SCHEDULER_TIMEZONE}
+  MYSQL_HOST: ${MYSQL_HOST:-mysql}
+  MYSQL_PORT: ${MYSQL_PORT:-3306}
+  MYSQL_SOCKET: ${MYSQL_SOCKET:-}
+  MYSQL_DATABASE: ${MYSQL_DATABASE}
+  MYSQL_USER: ${MYSQL_USER}
+  MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+  MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+  REDIS_URL: ${REDIS_URL}
+  MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+  MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+  MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+  MINIO_BUCKET: ${MINIO_BUCKET}
+  META_APP_ID: ${META_APP_ID}
+  META_APP_SECRET: ${META_APP_SECRET}
+  META_VERIFY_TOKEN: ${META_VERIFY_TOKEN}
+  GRAPH_API_VERSION: ${GRAPH_API_VERSION}
+  AI_PROVIDER_KEY: ${AI_PROVIDER_KEY}
+
+x-api-base: &api-base
+  build:
+    context: ../backend
+    dockerfile: Dockerfile
+  image: saa-core-api:0.3.2
+  restart: unless-stopped
+  environment: *api-env
+  depends_on:
+    mysql:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  networks:
+    - saa_internal
+
+x-worker-health: &worker-health
+  test:
+    - CMD-SHELL
+    - test -f /tmp/worker.heartbeat && test $(( $(date +%s) - $(stat -c %Y /tmp/worker.heartbeat) )) -lt 90
+  interval: 20s
+  timeout: 5s
+  retries: 3
+  start_period: 20s
+
+services:
+  nginx:
+    image: nginx:1.27.3-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_started
+        required: false
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - saa_public
+      - saa_internal
+
+  web:
+    profiles: ["web"]
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    image: saa-core-web:0.3.2
+    restart: unless-stopped
+    expose:
+      - "3000"
+    environment:
+      NODE_ENV: production
+      API_BASE_URL: http://api:8000
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/status || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - saa_internal
+
+  api:
+    <<: *api-base
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=4).status==200 else 1)\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  worker-publish:
+    <<: *api-base
+    command: ["python", "-m", "app.worker"]
+    environment:
+      <<: *api-env
+      WORKER_ROLE: worker-publish
+    healthcheck: *worker-health
+
+  worker-sync:
+    <<: *api-base
+    command: ["python", "-m", "app.worker"]
+    environment:
+      <<: *api-env
+      WORKER_ROLE: worker-sync
+    healthcheck: *worker-health
+
+  worker-ai:
+    <<: *api-base
+    command: ["python", "-m", "app.worker"]
+    environment:
+      <<: *api-env
+      WORKER_ROLE: worker-ai
+    healthcheck: *worker-health
+
+  beat:
+    <<: *api-base
+    command: ["python", "-m", "app.beat"]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - test -f /tmp/beat.heartbeat && test $(( $(date +%s) - $(stat -c %Y /tmp/beat.heartbeat) )) -lt 180
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  mysql:
+    image: mysql:8.4.6
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+00:00
+      - --max-connections=200
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      TZ: UTC
+    expose:
+      - "3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    networks:
+      - saa_internal
+
+  redis:
+    image: redis:7.4.2-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "900", "1"]
+    expose:
+      - "6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks:
+      - saa_internal
+
+  minio:
+    image: ${MINIO_IMAGE:-coollabsio/minio:RELEASE.2025-10-15T17-29-55Z}
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    expose:
+      - "9000"
+      - "9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mc alias set health http://127.0.0.1:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null && mc ready health
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks:
+      - saa_internal
+
+volumes:
+  mysql-data:
+  redis-data:
+  minio-data:
+
+networks:
+  saa_public:
+    driver: bridge
+  saa_internal:
+    driver: bridge
+    internal: false

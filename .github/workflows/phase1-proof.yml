@@ -1,0 +1,100 @@
+name: PHASE1-PROOF
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versions
+        run: |
+          docker version
+          docker compose version
+
+      - name: Prepare .env (مولّد داخل الـrunner — لا أسرار في المستودع)
+        run: |
+          set -e
+          {
+            echo "APP_ENV=local"
+            echo "APP_SECRET=$(openssl rand -hex 32)"
+            echo "SESSION_SECRET=$(openssl rand -hex 32)"
+            echo "KEK_PATH=/run/secrets/kek"
+            echo "LOG_LEVEL=INFO"
+            echo "SCHEDULER_TIMEZONE=Asia/Riyadh"
+            echo "MYSQL_HOST=mysql"
+            echo "MYSQL_PORT=3306"
+            echo "MYSQL_DATABASE=saa_core"
+            echo "MYSQL_USER=saauser"
+            echo "MYSQL_PASSWORD=$(openssl rand -hex 16)"
+            echo "MYSQL_ROOT_PASSWORD=$(openssl rand -hex 16)"
+            echo "MYSQL_SOCKET="
+            echo "REDIS_URL=redis://redis:6379/0"
+            echo "MINIO_ENDPOINT=http://minio:9000"
+            echo "MINIO_ROOT_USER=$(openssl rand -hex 12)"
+            echo "MINIO_ROOT_PASSWORD=$(openssl rand -hex 16)"
+            echo "MINIO_BUCKET=saa-media"
+            echo "MINIO_IMAGE="
+            echo "META_APP_ID=1847445519605053"
+            echo "META_APP_SECRET="
+            echo "META_VERIFY_TOKEN=$(openssl rand -hex 12)"
+            echo "GRAPH_API_VERSION=v23.0"
+            echo "AI_PROVIDER_KEY="
+          } > .env
+
+      - name: Dev TLS certs
+        run: bash scripts/gen-dev-certs.sh
+
+      - name: Compose config
+        run: docker compose --env-file .env -f infra/docker-compose.yml --profile web config --services
+
+      - name: Compose up (build)
+        run: docker compose --env-file .env -f infra/docker-compose.yml --profile web up -d --build
+
+      - name: Wait for health
+        run: |
+          for i in $(seq 1 40); do
+            code=$(curl -sk -o /dev/null -w '%{http_code}' https://localhost/health || true)
+            echo "attempt $i -> $code"
+            [ "$code" = "200" ] && break
+            sleep 15
+          done
+
+      - name: Collect proof
+        run: |
+          exec 3>&1
+          {
+            echo "===== PHASE 1 PROOF · $(date -u +%FT%TZ) ====="
+            echo "--- docker version ---"; docker version
+            echo "--- compose ps ---"; docker compose --env-file .env -f infra/docker-compose.yml ps
+            echo "--- services ---"; docker compose --env-file .env -f infra/docker-compose.yml --profile web config --services
+            echo "--- /health ---"; curl -sk -w '\nHTTP %{http_code}\n' https://localhost/health
+            echo "--- /health #2 (بعد 3 ثوانٍ: uptime يجب أن يزيد) ---"; sleep 3; curl -sk -w '\nHTTP %{http_code}\n' https://localhost/health
+            echo "--- /health/ready ---"; curl -sk -w '\nHTTP %{http_code}\n' https://localhost/health/ready
+            echo "--- /api/v1/health (عبر Next) ---"; curl -sk -w '\nHTTP %{http_code}\n' https://localhost/api/v1/health
+            echo "--- / ---"; curl -sk -o /dev/null -w 'HTTP %{http_code} -> %{redirect_url}\n' https://localhost/
+            echo "--- /status ---"; curl -sk -o /dev/null -w 'HTTP %{http_code}\n' https://localhost/status
+            echo "--- داخل حاوية api ---"
+            docker compose --env-file .env -f infra/docker-compose.yml exec -T api python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8000/health/ready',timeout=5).read().decode())" || true
+            echo "--- logs: api ---"; docker compose --env-file .env -f infra/docker-compose.yml logs --tail=40 api
+            echo "--- logs: web ---"; docker compose --env-file .env -f infra/docker-compose.yml logs --tail=25 web
+            echo "--- logs: nginx ---"; docker compose --env-file .env -f infra/docker-compose.yml logs --tail=25 nginx
+            echo "===== END ====="
+          } 2>&1 | tee PHASE1_PROOF.txt >&3
+
+      - name: Upload proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PHASE1_PROOF
+          path: PHASE1_PROOF.txt
+          if-no-files-found: warn
+
+      - name: Teardown
+        if: always()
+        run: docker compose --env-file .env -f infra/docker-compose.yml --profile web down -v || true
